@@ -16,6 +16,3 @@ The project included 3 phases:
 The earlier files are included to demonstrate how the team progressed through the project-- starting with raw data and ending with a curated set of insights and solutions. If you are only interested in the finished product, all of the finalized code can be found in the files marked "Final".
 
 Please note: Personal identifiable information, though used occasionally in the analyses, has been removed from all files here and are indicated by bracketed placeholders.
-
-QTM Students: Suzanne Martin, Jhaelle Payne, Anna Ringwood, Caris Weilenmann  
-Industry Mentor: Scott Parent
