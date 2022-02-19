@@ -7,8 +7,8 @@ The project included 3 phases:
     a. Import and Explore Data.Rmd  
     b. Insights Report.Rmd  
 2. Combining and/or Removing Duplicate Records  
-    a. Developing the Deduplicating Process  
-    b. Finalizing the Deduplicating Process    
+    a. Developing the Deduplicating Process.Rmd  
+    b. Finalizing the Deduplicating Process.Rmd    
 3. Supplementing Data and Presenting Results  
     a. Final - Bloomerang.Rmd  
     b. Final - Mailchimp.Rmd  
