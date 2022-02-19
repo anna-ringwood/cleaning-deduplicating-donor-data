@@ -4,11 +4,11 @@ This project was carried out with the support of the [Quantitative Theory and Me
 
 The project included 3 phases:  
 1. Exploration and Initial Insights  
-    a. 01 Import and Explore Data.Rmd  
-    b. 02.5 Insights Report 1.Rmd  
+    a. Import and Explore Data.Rmd  
+    b. Insights Report.Rmd  
 2. Combining and/or Removing Duplicate Records  
-    a. 04.5 Developing the Deduplicating Process  
-    b. 06 Finalizing the Deduplicating Process    
+    a. Developing the Deduplicating Process  
+    b. Finalizing the Deduplicating Process    
 3. Supplementing Data and Presenting Results  
     a. Final - Bloomerang.Rmd  
     b. Final - Mailchimp.Rmd  
