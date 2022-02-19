@@ -5,7 +5,6 @@ This project was carried out with the support of the [Quantitative Theory and Me
 The project included 3 phases:  
 1. Exploration and Initial Insights  
     a. Import and Explore Data.Rmd  
-        i. Images of the figures produced in this file can be found in the Visualizations folder
     b. Insights Report.Rmd  
 2. Combining and/or Removing Duplicate Records  
     a. Developing the Deduplicating Process  
