@@ -1,0 +1,232 @@
+---
+title: "Insights Report"
+author: "Anna Ringwood"
+date: "5/16/2021 (Last Updated: 5/17/2021)"
+output:
+  prettydoc::html_pretty:
+    df_print: kable
+    theme: cayman
+    highlight: github
+    toc: no
+    toc_depth: 2
+    toc_float:
+      collapsed: no
+  pdf_document:
+    toc: no
+    toc_depth: '2'
+urlcolor: blue
+---
+
+We've gotten a bit more direction on what exactly we're looking for, so this file builds upon the previous ones by focusing in on important aspects of our data.
+
+```{r echo = F, message = F}
+library(tidyverse)
+library(janitor)
+library(lubridate)
+library(skimr)
+```
+
+# Import and Clean Data
+
+```{r warning = F}
+### generic cleaning function
+remove_str_make_num <- function(df_column, char_to_remove){
+  df_column <- as.numeric(str_remove(df_column, char_to_remove))
+  return(df_column)}
+
+# -----------------------------------------------------------------------------
+
+### Mailchimp
+mailchimpRaw <- read.csv("Z:/subscribed_members_export_06457f1bdc.csv",
+                      header = TRUE, na.strings = "") %>%
+  clean_names("lower_camel")
+
+### change variable types
+mailchimpClean <- mailchimpRaw %>%
+  mutate(across(all_of(c("latitude", "longitude", "gmtoff", "dstoff")), 
+                ~ remove_str_make_num(.x, char_to_remove = "'")),
+         across(all_of(c("optinTime", "confirmTime", "lastChanged")), ~ ymd_hms(.x)),
+         across(where(is.character), str_to_lower),
+         address = str_squish(address),
+         tags = str_remove_all(tags, "[\"]"),
+         tags = str_replace_all(tags, ",", "|"))
+
+# -----------------------------------------------------------------------------
+
+### Bloomerang
+bloomConstsRaw <- read.csv("Z:/Emory QTM - Constituents - All Fields CSV.csv",
+                        header = TRUE, na.strings = "") %>%
+  clean_names("lower_camel")
+
+### change variable names and types
+bloomConstsClean <- bloomConstsRaw %>%
+  rename(todaysDate = todaySDate, vipsAndInfluencers = viPsAndInfluencers) %>%
+  mutate(accountNumberStr = as.character(accountNumber),
+         createdDate = mdy_hm(createdDate),
+         lastModifiedDate = mdy_hm(lastModifiedDate),
+         across(all_of(c("firstTransactionAmount", "largestTransactionAmount", "lastYearRaised",
+                         "lastYearRevenue", "latestTransactionAmount", "lifetimeRaised",
+                         "lifetimeRevenue", "secondTransactionAmount", "yearToDateRaised",
+                         "yearToDateRevenue")), ~ remove_str_make_num(.x, char_to_remove = "[$]")),
+         across(all_of(c("birthdate", "firstTransactionDate", "largestTransactionDate",
+                         "latestTransactionDate", "secondTransactionDate", "todaysDate")), ~ mdy(.x)),
+         numberOfTransactions = remove_str_make_num(numberOfTransactions, char_to_remove = ","),
+         across(where(is.character), str_to_lower)) %>%
+  select(-name1) # this column is identical to the `name` one
+### separate aggregate first row
+totalsBloomConsts <- bloomConstsClean[1,]
+bloomConstsClean <- bloomConstsClean[-1,]
+
+bloomIntsRaw <- read.csv("Z:/Emory QTM - Interactions - All Fields CSV.csv",
+                        header = TRUE, na.strings = "") %>%
+  clean_names("lower_camel")
+
+bloomIntsClean <- bloomIntsRaw %>%
+  select(-c("date1", "channel1", "note1", "purpose1", "subject1")) %>%
+  mutate(date = mdy(date), createdDate = mdy_hm(createdDate),
+         lastModifiedDate = mdy_hm(lastModifiedDate),
+         across(where(is.character), str_to_lower))
+```
+
+# **Goals**
+
+**From Nonprofit:**  
+
+* The Mailchimp Newsletter list (a.k.a. the data we have) isn’t segmented  
+
+* They are concerned with missing people who aren’t on the Mailchimp Newsletter list-- want to keep everyone engaged  
+
+* Also want to avoid sending repeat emails to people  
+
+* Gauge the relationship between engagement and various initiatives
+
+What information can we add to a specific person so that the nonprofit can look at it and then make a better decision about how to market?
+
+# **Ideas:**
+
+1. We can try to merge the Mailchimp and Bloomerang data based on email + name, which may get us closer to the end game of a fully merged list.
+
+2. Do people in specific occupations attend specific events? If so, we can send emails about certain events to these specific groups, which would be more effective (and less annoying to uninterested groups, in the interest of overall constituent retention) than a blanket email.
+
+# **Execution:**
+
+### 1. Merging Data Across Bloomerang and Mailchimp:
+
+We pretty much have to address the Bloomerang duplicates before anything else - Do the repeat emails have particular Individual/Organization occurrence patterns? (This way, we might be able to remove some duplicates by recording the individual as the primary contact for the organization. Also, this will make merging Bloomerang and Mailchimp easier.)
+
+```{r}
+### summarize all non-NA emails and whether they appear as an organization or individual
+bloomOrgIndCounts <- bloomConstsClean %>%
+  group_by(primaryEmailAddress) %>%
+  filter(is.na(primaryEmailAddress) == FALSE) %>%
+  summarize(numOccurTotal = n(),
+            numOrgs = sum(type == "organization"),
+            numIndivs = sum(type == "individual")) 
+# 3178 rows/unique and non-NA emails (this tracks)
+### check that counts are correct
+sum(bloomOrgIndCounts$numOccurTotal != (bloomOrgIndCounts$numOrgs + bloomOrgIndCounts$numIndivs))
+# no mismatches
+
+### filter for emails occurring more than once
+bloomOrgIndCounts <- bloomOrgIndCounts %>%
+  filter(numOccurTotal != 1)
+# 243 rows/emails (also tracks)
+
+bloomOrgIndCounts %>%
+  summarize(orgAndInd = sum(numOrgs != 0 & numIndivs != 0), # 39
+            orgOnly = sum(numOrgs != 0 & numIndivs == 0), # 3
+            indOnly = sum(numOrgs == 0 & numIndivs != 0)) # 201
+39 + 3 + 201
+```
+
+```{r}
+bloomOrgIndCounts %>%
+  filter(numOrgs != 0 & numIndivs != 0) %>%
+  filter(numOrgs == 1 & numIndivs == 1) %>%
+  head(10)
+# these 33 emails could be consolidated by listing the individual's info as the primary contact info for the organization's account.
+
+bloomOrgIndCounts %>%
+  filter(numOrgs != 0 & numIndivs != 0) %>%
+  filter(numOrgs != 1 | numIndivs != 1)
+# these 6 emails should be examined further before trying to consolidate accounts.
+
+# -----------------------------------------------------------------------------
+
+bloomOrgIndCounts %>%
+  filter(numIndivs == 0)
+# these 3 emails should be examined further before trying to consolidate accounts.
+
+bloomOrgIndCounts %>%
+  filter(numOrgs == 0) %>%
+  head(10)
+# the duplicates of these 201 emails are probably the result of different individuals in the same household or organization using the same email address.
+```
+
+It may be helpful to group the last set of 201 individuals above into "households" with one common email address? Or evaluate why these individuals all used the same email address to sign up (e.g. two people in the same household may wish to be recorded separately if they attend different events/make different donations/etc.)
+
+Can we use email address + full name as the Bloomerang primary key?
+
+```{r}
+bloom1 <- bloomConstsClean %>%
+  filter(primaryEmailAddress %in% pull(bloomOrgIndCounts, primaryEmailAddress)) 
+bloom2 <- bloom1 %>%
+  group_by(primaryEmailAddress) %>%
+  summarize(numOccurTotal = n(),
+            numUnqName = n_distinct(name))
+
+bloom2[which(bloom2$numOccurTotal != bloom2$numUnqName),]
+```
+
+Except for one particular email, all other email-name pairs can be used as primary keys for Bloomerang
+
+```{r}
+both <- full_join(bloomConstsClean, mailchimpClean, 
+                  by = c("primaryEmailAddress" = "emailAddress", "firstName", "lastName"),
+                  suffix = c("_bloom", "_mc"))
+
+bloomFullNames <- bloomConstsClean %>%
+  filter(is.na(firstName) == FALSE & is.na(lastName) == FALSE &
+           is.na(primaryEmailAddress) == FALSE)
+
+mcFullNames <- mailchimpClean %>%
+  filter(is.na(firstName) == FALSE & is.na(lastName) == FALSE)
+
+both2 <- full_join(bloomFullNames, mcFullNames, by = c("primaryEmailAddress" = "emailAddress",
+                                                   "firstName", "lastName"),
+                  suffix = c("_bloom", "_mc")) %>%
+  select(primaryEmailAddress, firstName, lastName, name)
+```
+
+In conclusion, matching up duplicates in Bloomerang to emails is Mailchimp is doable, but would require a lot of manual effort.
+
+### 2. Event Attendance:
+
+```{r}
+eventsList <- str_split(bloomConstsClean$eventsAttended, "[|]", simplify = TRUE)
+eventsList2 <- cbind(bloomConstsClean$accountNumber, eventsList)
+eventsdf <- data.frame(eventsList2)
+eventsdf[eventsdf == ""] <- NA
+
+eventsNames <- c("accountNumber")
+for(i in 1:18){eventsNames <- append(eventsNames, paste0("event", i))}
+names(eventsdf) <- eventsNames
+
+eventsVector <- vector()
+for(i in 2:19){eventsVector <- append(eventsVector, eventsdf[,i])}
+
+everyEventEver <- data.frame(eventsVector)
+eventCounts <- everyEventEver %>%
+  group_by(eventsVector) %>%
+  summarize(numAttendees = n()) %>%
+  mutate(eventsAbbr = str_trunc(eventsVector, 40),
+         eventsAbbr = fct_reorder(eventsAbbr, numAttendees))
+
+eventCounts %>%
+  filter(is.na(eventsVector) == FALSE) %>%
+  ggplot(aes(x = eventsAbbr, y = numAttendees)) + geom_col(fill = "skyblue") +
+  coord_flip() + theme_minimal() + labs(title = "Event Attendance",
+                                        x = "Event", y = "Number of Attendees")
+```
+
+For privacy reasons, the resulting events attendance graph is not shown.

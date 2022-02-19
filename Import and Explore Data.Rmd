@@ -1,0 +1,286 @@
+---
+title: "Import and Explore Data"
+author: "Anna Ringwood"
+date: "4/29/2021; Last Updated: 5/11/2021"
+output:
+  prettydoc::html_pretty:
+    df_print: kable
+    theme: cayman
+    highlight: github
+    toc: no
+    toc_depth: 2
+    toc_float:
+      collapsed: no
+  pdf_document:
+    toc: no
+    toc_depth: '2'
+urlcolor: blue
+---
+
+In this first file, we explore the data that we have received. Exploration is important because it will help us determine what data we have to work with, what insights we can derive from the current data, and what information is missing that we may be able to obtain from another source to supplement what we have.
+
+# **IMPORT LIBRARIES, IMPORT AND SKIM DATA SETS**
+
+```{r setup}
+library(tidyverse)
+library(janitor)
+library(lubridate)
+library(skimr)
+library(forcats)
+library(ggpubr)
+library(cowplot)
+```
+
+Import the raw data:
+
+```{r}
+mailchimp <- read.csv("Z:/subscribed_members_export_06457f1bdc.csv",
+                      header = TRUE, na.strings = "") %>%
+  clean_names("lower_camel")
+bloomInts <- read.csv("Z:/Emory QTM - Interactions - All Fields CSV.csv",
+                      header = TRUE, na.strings = "") %>%
+  clean_names("lower_camel")
+bloomConsts <- read.csv("Z:/Emory QTM - Constituents - All Fields CSV.csv",
+                        header = TRUE, na.strings = "") %>%
+  clean_names("lower_camel")
+```
+
+Examine data:
+
+```{r}
+skim(mailchimp)
+skim(bloomConsts)
+skim(bloomInts)
+```
+
+***
+
+# **BROADLY CLEAN DATA SETS**
+
+Meaning that we're making sure columns are named consistently, duplicate columns don't exist, column types are correct, general column/variable-wide corrections, etc.
+
+### MailChimp Data
+
+- Change `latitude`, `longitude`, `gmtoff`, and `dstoff` columns to numeric  
+- Change `optinTime`, `confirmTime`, and `lastChanged` columns to date-time  
+- Everything else stays as character type
+
+```{r}
+# Cleaning function
+remove_str_to_num <- function(df_column, char_to_remove){
+  df_column <- as.numeric(str_remove(df_column, char_to_remove))
+  return(df_column)}
+
+# Change variable types
+mailchimpClean <- mailchimp %>%
+  mutate(across(all_of(c("latitude", "longitude", "gmtoff", "dstoff")), 
+                ~ remove_str_to_num(.x, char_to_remove = "'"))) %>%
+  mutate(across(all_of(c("optinTime", "confirmTime", "lastChanged")),
+                ~ ymd_hms(.x)))
+
+skimMailchimp <- skim(mailchimpClean)
+```
+
+**Additional foreseeable problems (not addressed yet):**  
+- Inconsistent capitalization in first/lastName, address, country, region  
+- Non-UTC-8 characters in some fields
+
+### Bloomerang Constituents Data
+
+- Fix names that `janitor` didn't get quite right  
+- Make a character version of `accountNumber`  
+- Change `numberOfTransactions` to numeric
+- Change currency variables from character to numeric
+- Separate first row, which contains total counts  
+
+```{r warning = F}
+# Change variable names that have incorrect capitalizations
+bloomConstsClean <- bloomConsts %>%
+  rename(todaysDate = todaySDate, vipsAndInfluencers = viPsAndInfluencers)
+
+# Change variable types
+bloomConstsClean <- bloomConstsClean %>%
+  mutate(accountNumberStr = as.character(accountNumber), birthdate = mdy(birthdate),
+         createdDate = mdy_hm(createdDate), lastModifiedDate = mdy_hm(lastModifiedDate),
+         across(all_of(c("firstTransactionAmount", "largestTransactionAmount", "lastYearRaised",
+                         "lastYearRevenue", "latestTransactionAmount", "lifetimeRaised",
+                         "lifetimeRevenue", "secondTransactionAmount", "yearToDateRaised",
+                         "yearToDateRevenue")), ~ remove_str_to_num(.x, char_to_remove = "[$]")),
+         across(all_of(c("firstTransactionDate", "largestTransactionDate", "latestTransactionDate",
+                         "secondTransactionDate", "todaysDate")), ~ mdy(.x)),
+         numberOfTransactions = remove_str_to_num(numberOfTransactions, char_to_remove = ","))
+
+# Separate aggregate first row
+bloomConstsTotals <- bloomConstsClean[1,]
+bloomConstsClean <- bloomConstsClean[-1,]
+
+skimBloomConsts <- skim(bloomConstsClean)
+```
+
+**Additional foreseeable problems (not addressed yet):**  
+- There's a 6-month-old on the Board of Directors (obs. 293)...  
+- `\n` in some fields of `primaryAddress`
+
+### Bloomerang Interactions Data
+
+- Check for duplicate columns in Bloomerang Interactions  
+- Remove duplicate columns in Bloomerang Interactions
+
+```{r}
+sum(bloomInts$channel != bloomInts$channel1)
+sum(bloomInts$date != bloomInts$date1)
+sum(bloomInts$purpose != bloomInts$purpose1, na.rm = TRUE)
+sum(bloomInts$subject != bloomInts$subject1)
+sum(bloomInts$note != bloomInts$note1, na.rm = TRUE)
+
+bloomIntsClean <- bloomInts %>%
+  select(-c(channel1, date1, purpose1, subject1, note1)) %>%
+  mutate(date = mdy(date), createdDate = mdy_hm(createdDate), lastModifiedDate = mdy_hm(lastModifiedDate),
+         accountNumberStr = as.character(accountNumber))
+
+skimBloomInts <- skim(bloomIntsClean)
+```
+
+**Additional foreseeable problems (not addressed yet):**  
+- None at the moment 
+
+***
+
+# **EXAMINE OVERLAPPING AND MISSING DATA**
+
+```{r}
+variable_completeness <- function(skim_df){
+  na_plot <- skim_df %>%
+    mutate(skim_variable = fct_reorder(skim_variable, complete_rate)) %>%
+    ggplot(aes(x = skim_variable, y = complete_rate)) +
+    geom_segment(aes(x = skim_variable, xend = skim_variable, y = 0, yend = complete_rate,
+                     color = complete_rate == 1)) +
+    geom_point(aes(color = complete_rate == 1)) + 
+    scale_color_manual(name = "Is a Complete\nVariable", 
+                       values = setNames(c("green", "red"), c(TRUE, FALSE))) +
+    theme_minimal() + theme(axis.text.y = element_text(size = 8)) + coord_flip()
+  return(na_plot)
+}
+
+variable_completeness(skimMailchimp) + 
+    labs(title = "MailChimp Variables Ordered by Completeness")
+
+skimBloomConsts %>%
+  filter(complete_rate == 1) %>%
+  variable_completeness() +
+  labs(title = "Bloomerang Constituents Complete Variables")
+
+skimBloomConsts %>%
+  filter(complete_rate != 1) %>%
+  variable_completeness() +
+  labs(title = "Bloomerang Constituents Incomplete Variables")
+
+variable_completeness(skimBloomInts) + 
+    labs(title = "Bloomerang Interaction Variables Ordered by Completeness")
+```
+
+Are there any Bloomerang constituents that also are listed as subscribers in Mailchimp? Are there Mailchimp subscribers that appear in Bloomerang?
+
+Mailchimp: 4,085 unique email addresses (primary key)
+
+Bloomerang: primaryEmailAddress n_missing 208; n_unique 3178; total observations 3770
+
+```{r}
+bmgNonNAEmails <- bloomConstsClean %>%
+  filter(is.na(primaryEmailAddress) == FALSE)
+# 3562 non-missing (208 missing)
+
+n_distinct(bmgNonNAEmails$primaryEmailAddress)
+# 3178 unique
+
+dupEmails <- bmgNonNAEmails %>%
+  group_by(primaryEmailAddress) %>%
+  summarize(numEmails = n()) %>%
+  # 3178 rows (as expected)
+  filter(numEmails != 1) %>%
+  # 243 rows
+  pull(primaryEmailAddress)
+
+uniqueEmailsOnly <- bmgNonNAEmails %>%
+  group_by(primaryEmailAddress) %>%
+  summarize(numEmails = n()) %>%
+  pull(primaryEmailAddress)
+
+allDupEmails <- bloomConstsClean %>%
+  filter(primaryEmailAddress %in% dupEmails)
+```
+
+Compare to Mailchimp emails:
+
+```{r}
+mailchimpEmails <- mailchimpClean %>%
+  select(emailAddress)
+
+combinedEmails <- full_join(mailchimpEmails, uniqueEmailsOnly, by = c("emailAddress" = "primaryEmailAddress"))
+```
+
+
+***
+
+# **INSIGHTS FROM DATA**
+
+## Segment by donation activity:
+
+One thing we can find out is how many people have made a donation in a particular time frame. We can create a new variable, `latestTransactionDate`, with the values "within the past year", "within the past two years", "not within past two years", and "unknown".
+
+Nonprofits typically have a fiscal year from July 1 - June 30, but we may want to ask the nonprofit to double-check.
+
+```{r}
+withinLastYrStart <- as.Date("07/01/2020", format = c("%m/%d/%Y"))
+withinLastTwoYrsStart <- as.Date("07/01/2019", format = c("%m/%d/%Y"))
+
+# Could turn this into an if-if-else statement to clean up code
+bloomConstsClean$latestTransDateSgmt <- factor(NA, levels = c("withinLastYear",
+                                                              "withinLastTwoYears", 
+                                                              "moreThanTwoYearsAgo",
+                                                              "unknown"))
+bloomConstsClean$latestTransDateSgmt[is.na(
+  bloomConstsClean$latestTransactionDate) == TRUE] <- "unknown"
+bloomConstsClean$latestTransDateSgmt[bloomConstsClean$latestTransactionDate >=
+                                       withinLastYrStart] <- "withinLastYear"
+bloomConstsClean$latestTransDateSgmt[bloomConstsClean$latestTransactionDate >= 
+                                       withinLastTwoYrsStart &
+                                       bloomConstsClean$latestTransactionDate < 
+                                       withinLastYrStart] <- "withinLastTwoYears"
+bloomConstsClean$latestTransDateSgmt[bloomConstsClean$latestTransactionDate < 
+                                       withinLastTwoYrsStart] <- "moreThanTwoYearsAgo"
+```
+
+## Visualize Recent Donation Activity
+
+```{r}
+table(bloomConstsClean$latestTransDateSgmt)
+
+ggplot(bloomConstsClean, aes(x = numberOfTransactions, y = latestTransactionAmount, 
+                             color = latestTransDateSgmt)) + 
+  geom_point(alpha = 0.3) + geom_smooth() + facet_wrap(vars(latestTransDateSgmt)) +
+  theme_minimal()
+```
+
+```{r}
+ggplot(bloomConstsClean, aes(x = numberOfTransactions, y = largestTransactionAmount)) + geom_point()
+cor(bloomConstsClean$numberOfTransactions, bloomConstsClean$largestTransactionAmount, use = "na.or.complete")
+```
+
+## Event Attendance and Donation Quantities
+
+Is the size of a person's donation correlated with the number of events that they attend?
+
+```{r}
+bloomConstsClean <- bloomConstsClean %>%
+  mutate(numEventsAttended = str_count(eventsAttended, "[|]") + 1) %>%
+  relocate(numEventsAttended, .after = eventsAttended)
+
+numTransByEvent <- ggplot(bloomConstsClean, aes(x = numEventsAttended, y = numberOfTransactions)) + geom_point(alpha = 0.3) +
+  geom_smooth() + theme_minimal() + theme(axis.title.x = element_blank())
+largestAmtByEvent <- ggplot(bloomConstsClean, aes(x = numEventsAttended, y = largestTransactionAmount)) + geom_point(alpha = 0.3) +
+  geom_smooth() + theme_minimal()
+cowplot::plot_grid(numTransByEvent, largestAmtByEvent, align = "v", ncol = 1, rel_heights = c(0.5, 0.5))
+```
+
+These are all insights that may be of some interest to the nonprofit organization. We should discuss them in our next meeting.

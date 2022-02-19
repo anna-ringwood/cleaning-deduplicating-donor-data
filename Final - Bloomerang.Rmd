@@ -1,0 +1,538 @@
+---
+title: "Final - Bloomerang"
+author: "Anna Ringwood"
+date: "8/6/2021"
+output: html_document
+---
+
+This is the final version of the code to clean and wrangle the data from Bloomerang. Much of it is similar or identical to code from the previous files, but here it has been cleaned and annotated for ease of reading.
+
+## Libraries
+
+```{r message = F}
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(postmastr)
+```
+
+# Import Data
+
+```{r}
+consts <- read.csv("Z:/Final Files/Constituents.csv", header = TRUE, na.strings = "") %>%
+  clean_names("upper_camel") %>%
+  rename("AccountNumber" = "IAccountNumber",
+         "CustomVIPsAndInfluencers" = "CustomViPsAndInfluencers")
+
+addrs <- read.csv("Z:/Final Files/Addresses.csv", header = TRUE, na.strings = "") %>%
+  clean_names("upper_camel") %>%
+  rename("AccountNumber" = "IAccountNumber",
+         "AddressIsBad" = "IsBad") %>%
+  filter(IsPrimary == "True")
+
+emails <- read.csv("Z:/Final Files/Emails.csv", header = TRUE, na.strings = "") %>%
+  clean_names("upper_camel") %>%
+  rename("AccountNumber" = "IAccountNumber",
+         "PrimaryEmailAddress" = "Value",
+         "EmailIsBad" = "IsBad") %>%
+  filter(IsPrimary == "True")
+
+trans <- read.csv("Z:/Final Files/Transactions.csv", header = TRUE, na.strings = "")%>%
+  clean_names("upper_camel") %>%
+  rename("AccountNumber" = "IAccountNumber")
+```
+
+# Transform Data
+
+```{r}
+transSeg <- trans %>%
+  mutate(Date = mdy_hms(Date)) %>%
+  group_by(AccountNumber) %>%
+  arrange(desc(Date)) %>%
+  summarize(LatestTransactionDate = max(Date))
+
+bloomData <- consts %>%
+  left_join(select(addrs, -c("County", "IsPrimary", "TypeName")), by = "AccountNumber") %>%
+  left_join(select(emails, AccountNumber, PrimaryEmailAddress, EmailIsBad), by = "AccountNumber") %>%
+  left_join(transSeg, by = "AccountNumber") %>%
+  mutate(AddressIsBad = as.logical(AddressIsBad),
+         EmailIsBad = as.logical(EmailIsBad),
+         across(c("Birthdate", "CreatedDate", "LastModifiedDate"), ~ mdy_hms(.x))) %>%
+  rename("PrimaryCity" = "City", "PrimaryCountry" = "Country", "PrimaryZipCode" = "PostalCode",
+         "PrimaryState" = "State", "PrimaryStreet" = "Street") %>%
+  relocate(FullName, PrimaryEmailAddress, .after = "AccountNumber")
+```
+
+# Identify Duplicates
+
+Filter for accounts of type "Individual" and calculate the number of times each name appears in the resulting data set; extract names that appear more than once into `duplicateIndivs`:
+
+```{r}
+### Get vector of names which appear more than once
+duplicateIndivs <- bloomData %>%
+  filter(Type == "Individual") %>%
+  group_by(FullName) %>%
+  summarize(numOccur = n()) %>%
+  filter(numOccur != 1) %>%
+  pull(FullName)
+```
+
+Filter `merged` for the names listed in `duplicateIndivs`, removing observations known to refer to separate records despite having the same name:
+
+*Note: Two names, although they appear more than once, do in fact represent different people, and thus the observations with these names are removed from the list. Further, two names each appear three times in the data set and list the same employer for two records but a different one for the third. Because a single individual with more than one employer is treated as separate records, and in order to ensure that the observations with the common employer are merged, the observation with the third, different employer is removed for each name.*
+
+```{r}
+### Filter out individuals whose names appear more than once
+duplicateRecords <- bloomData %>%
+  filter(FullName %in% duplicateIndivs & FullName != "Friend Unknown" & FullName != "[Constituent Name]" & 
+           !(FullName == "[Constituent Name]" & Employer == "[Constituent Employer]") & 
+           !(FullName == "[Constituent Name]" & Employer == "[Constituent Employer]"))
+
+### Fix `duplicateIndivs` correspondingly
+duplicateIndivs <- duplicateIndivs[duplicateIndivs != "Friend Unknown" & duplicateIndivs != "[Constituent Name]"]
+```
+
+```{r}
+### Put the remaining records (Individuals *and* Organizations) into a separate data frame
+nonDuplicates <- bloomData[!(bloomData$AccountNumber %in% duplicateRecords$AccountNumber),]
+sum(nonDuplicates$Type == "Individual")
+```
+
+### Individuals With More Than One Employer:
+
+Divide names in 'duplicateRecords' based on how many unique employers are given for each name:
+
+```{r}
+maybeNonDup <- data.frame()
+knownDupRecords <- data.frame()
+
+for(recordName in unique(pull(duplicateRecords, FullName))){
+  tempDF <- duplicateRecords %>%
+    filter(FullName == recordName)
+  unqEmployer <- n_distinct(pull(tempDF, Employer), na.rm = TRUE)
+  
+  if(unqEmployer > 1){
+    maybeNonDup <- rbind(maybeNonDup, tempDF)
+  }else{
+    knownDupRecords <- rbind(knownDupRecords, tempDF)
+  }
+}
+```
+
+Extract the 'FullName', 'Employer', and 'AccountNumber' columns and export them to a .csv file. Bring the CSV into Excel, and manually examine the employers for the 80 records. In Excel, compare all listed employers for each name. In a new column, enter a "1" if the employers are different entities, or enter a "0" if they are not and differ by spelling or name formatting:
+
+```{r}
+maybeNonDup2 <- maybeNonDup %>%
+  arrange(FullName, Employer) %>%
+  select(FullName, Employer, AccountNumber)
+
+#write.csv(maybeNonDup2, "Z:/Final Files/Employer Data Frame.csv", row.names = FALSE)
+```
+
+Bring the resulting spreadsheet back into R as 'employerIndicator'. Divide the records by the `isDiff` indicator variable:
+
+```{r}
+employerIndicator <- read.csv("Z:/Final Files/Employer Data Frame.csv", header = TRUE)
+
+trueNonDups <- employerIndicator %>%
+  filter(isDiff == 1)
+trueDuplicates <- employerIndicator %>%
+  filter(isDiff == 0)
+```
+
+Filter `maybeNonDup` records by `employerIndicator` value and append appropriately to `nonDuplicates` and `knownDupRecords`:
+
+```{r}
+newNonDupRows <- maybeNonDup %>%
+  filter(AccountNumber %in% trueNonDups$AccountNumber)
+nonDuplicates <- rbind(nonDuplicates, newNonDupRows)
+
+newDupRows <- maybeNonDup %>%
+  filter(AccountNumber %in% trueDuplicates$AccountNumber)
+knownDupRecords <- rbind(knownDupRecords, newDupRows)
+```
+
+# Deduplicating Helper Functions:
+
+Some scenarios to consider when collapsing duplicate records:
+
+* Across all records for a name, the values for a variable are the same  
+  * In this case, the value is copied over to the new record  
+  
+```{r}
+identicalRecordVals <- function(df_column){
+  identicalVals <- vector()
+  for(i in 2:length(df_column)){
+    identicalVals <- append(identicalVals, identical(df_column[i], df_column[i-1]))
+  }
+  if(sum(identicalVals == FALSE) == 0){
+    verdict <- TRUE
+  } else {
+    verdict <- FALSE
+  }
+  return(verdict)
+}
+```
+
+* Across all records for a name, there is at least one `NA` value in a variable but the remaining value(s) are the same  
+  * In this case, the unique, non-NA value is copied over to the new record  
+  
+```{r}
+oneUniqueField <- function(df_column){
+  colNoNA <- na.omit(df_column)
+  if(length(unique(colNoNA)) == 1){
+    verdict <- TRUE
+  } else {
+    verdict <- FALSE
+  }
+  return(verdict)
+}
+```
+
+* The values for a variable are additive and should be aggregated  
+  * In this case, all values across the records are pasted together  
+  
+```{r}
+### The following variables can be aggregated:
+aggregatableVars <- c("PrimaryEmailAddress", "AccountNumber", "EmailInterestType", "CustomEventsAttended", "JobTitle", "[variable]", "CustomVIPsAndInfluencers", "Employer", "PrimaryStreet", "PrimaryZipCode", "CustomHomeOwner", "PrimaryCity", "EnvelopeName", "FormalName", "RecognitionName", "Prefix", "SortName")
+
+aggregateVals <- function(df_column){
+  aggregated <- ""
+  df_column <- na.omit(df_column)
+  for(row in 1:length(df_column)){
+    if(row == length(df_column)){
+      aggregated <- paste0(aggregated, df_column[row])
+    }else{
+      aggregated <- paste0(aggregated, df_column[row], "|")
+    }
+  }
+  return(aggregated)
+}
+```
+
+* Across all records for a name, there are at least two non-NA values for a variable  
+  * In this case, a closer examination of the fields and values is required  
+    * `lastModifiedDate`: most recent date is kept  
+    * `lastModifiedBy`: whatever is attached to the kept `lastModifiedDate`
+
+Put together outer function to implement all helper functions correctly:
+
+```{r}
+collapseRecords <- function(full_name){
+  
+  # create newRecord to hold deduplicated information
+  newRecord <- bloomData[1,]
+  newRecord[1,] <- NA
+
+  personalInfoDF <- knownDupRecords %>%
+    filter(FullName == full_name)
+  
+  # run identicalRecordVals() on all columns
+  identicalVerdicts <- personalInfoDF %>%
+    summarize(across(everything(), ~ identicalRecordVals(.x)))
+  # split variables based on True/False
+  identicalTrue <- personalInfoDF[,identicalVerdicts == TRUE, drop = FALSE]
+  identicalTrueNames <- names(identicalTrue)
+  identicalFalse <- personalInfoDF[,identicalVerdicts == FALSE, drop = FALSE]
+  identicalFalseNames <- names(identicalFalse)
+  # add True results to newRecord
+  newRecord[1, identicalTrueNames] <- personalInfoDF[1, identicalTrueNames]
+
+  # run oneUniqueField() on all remaining columns
+  oneUniqueVerdicts <- identicalFalse %>%
+    summarize(across(everything(), ~ oneUniqueField(.x)))
+  # split based on True/False
+  oneUniqueTrue <- identicalFalse[,oneUniqueVerdicts == TRUE, drop = FALSE]
+  oneUniqueTrueNames <- names(oneUniqueTrue)
+  oneUniqueFalse <- identicalFalse[,oneUniqueVerdicts == FALSE, drop = FALSE]
+  oneUniqueFalseNames <- names(oneUniqueFalse)
+  # add True results to newRecord
+  uniqueValsInCol <- oneUniqueTrue %>%
+    summarize(across(everything(), unique)) %>%
+    na.omit()
+  for(col in oneUniqueTrueNames){
+    uniqueVal <- uniqueValsInCol[1, col]
+    newRecord[1, col] <- uniqueVal
+  }
+  
+  # run aggregateVals() on specific remaining columns
+  aggregateResults <- oneUniqueFalse %>%
+    summarize(across(any_of(aggregatableVars), ~ aggregateVals(.x)))
+  # split based on what was/was not aggregated
+  aggregatedTrue <- oneUniqueFalse[,names(aggregateResults), drop = FALSE]
+  aggregatedTrueNames <- names(aggregatedTrue)
+  aggregatedFalse <- oneUniqueFalse[,-which(names(oneUniqueFalse) %in% aggregatedTrueNames), drop = FALSE]
+  aggregatedFalseNames <- names(aggregatedFalse)
+  # add True results to newRecord
+  newRecord[1, aggregatedTrueNames] <- aggregateResults[1, aggregatedTrueNames]
+  
+  # run keepHighestVal() on specific remaining columns
+  keptHighest <- aggregatedFalse %>%
+    summarize(across(any_of("LastModifiedDate"), ~ max(.x, na.rm = TRUE)))
+  keptHighestTrueNames <- names(keptHighest)
+  newRecord[1, keptHighestTrueNames] <- keptHighest[1,]
+  if("LastModifiedDate" %in% keptHighestTrueNames){
+    newLastModBy <- personalInfoDF[personalInfoDF$LastModifiedDate == keptHighest$LastModifiedDate, "LastModifiedName"]
+    newRecord[1, "LastModifiedName"] <- newLastModBy[1]
+    keptHighestTrueNames <- append(keptHighestTrueNames, "LastModifiedName")
+  }
+  
+  # check if any columns remain uncombined
+  combinedColNames <- c(identicalTrueNames, oneUniqueTrueNames, aggregatedTrueNames, keptHighestTrueNames)
+  uncombinedCols <- personalInfoDF %>%
+    select(-all_of(combinedColNames))
+  uncombinedNames <- names(uncombinedCols)
+  
+  results_list <- list("allDuplicateRecords" = personalInfoDF, "remainingColumns" = uncombinedCols, "deduplicatedRecord" = newRecord)
+  
+  return(results_list)
+}
+```
+
+### Carry Out the Deduplicating:
+
+```{r}
+newRecordsDF <- data.frame()
+partiallyCollapsed <- vector()
+uniqueNames <- unique(knownDupRecords$FullName)
+
+for(indivName in uniqueNames){
+  recordsList <- collapseRecords(indivName)
+  newRecordsDF <- rbind(newRecordsDF, recordsList$deduplicatedRecord)
+}
+
+# And re-join to non-duplicated individuals, creating unique ID column:
+bloomConstsFinal <- rbind(newRecordsDF, nonDuplicates)
+bloomConstsFinal$bloomID <- c(1:nrow(bloomConstsFinal))
+bloomConstsFinal <- relocate(bloomConstsFinal, bloomID, .before = 1)
+```
+
+Removing aggregated duplicates:
+
+```{r}
+for(var in c("AccountNumber", "[variable]",
+             "CustomEventsAttended", "PrimaryEmailAddress",
+             "SortName", "PrimaryZipCode", "RecognitionName",
+             "FormalName", "InformalName", "EnvelopeName")){
+  for(i in 1:nrow(bloomConstsFinal)){
+    allEntries <- unlist(str_split(bloomConstsFinal[i, var], "[|]"))
+    bloomConstsFinal[i, var] <- str_c(unique(allEntries), collapse = "|")
+  }
+}
+```
+
+Splitting up emails into one email/field:
+
+```{r}
+for(i in 1:nrow(bloomConstsFinal)){
+  allEntries <- unlist(str_split(bloomConstsFinal[i, "PrimaryEmailAddress"], "[|]"))
+  bloomConstsFinal[i, "PrimaryEmailAddress"] <- str_c(unique(allEntries), collapse = "|")
+}
+bloomConstsFinal <- bloomConstsFinal %>%
+  separate(PrimaryEmailAddress, into = c("Email1", "Email2", "Email3"), sep = "[|]")
+```
+
+# Geocoding
+
+```{r}
+# Find records where the whole address is in one column:
+combinedAddr <- bloomConstsFinal %>%
+  filter(is.na(PrimaryStreet) == FALSE & is.na(PrimaryCity) == TRUE &
+           str_detect(PrimaryStreet, "[|]") == FALSE) %>%
+  select(bloomID, PrimaryStreet)
+
+# General format correction:
+combinedAddr$PrimaryStreet <- str_replace_all(combinedAddr$PrimaryStreet, "\n", " ")
+combinedAddr$PrimaryStreet <- str_remove_all(combinedAddr$PrimaryStreet, ",|\\.")
+
+# Preliminary address correction:
+combinedAddr[combinedAddr$bloomID == 1168, "PrimaryStreet"] <- "[Corrected Address]"
+combinedAddr[combinedAddr$bloomID == 1794, "PrimaryStreet"] <- "[Corrected Address]"
+
+# Dictionaries to use with postmastr:
+extra_abbr <- pm_append(type = "state", input = "Ga", output = "GA", locale = "us")
+stateDict <- pm_dictionary(type = "state", filter = "GA", append = extra_abbr,
+                           case = c("title", "upper", "lower"), locale = "us")
+extra_cities <- pm_append(type = "city", input = c("Augusta", "Athens", "Ellenwood"),
+                          output = c("Augusta", "Athens", "Ellenwood"))
+cityDict <- pm_dictionary(type = "city", filter = "GA", append = extra_cities,
+                          case = "title", locale = "us")
+dirDict <- pm_dictionary(type = "directional", case = c("title", "upper", "lower"), locale = "us")
+
+# Parse addresses with postmastr:
+bmgCombAddr01 <- pm_identify(combinedAddr, var = "PrimaryStreet")
+bmgCombAddr02 <- pm_parse(bmgCombAddr01, input = "full", address = "PrimaryStreet", output = "short", keep_parsed = "limited", dir_dict = dirDict, state_dict = stateDict, city_dict = cityDict)
+
+# Additional address correction:
+bmgCombAddr02[bmgCombAddr02$bloomID == 2408, c("pm.address", "pm.city", "pm.state", "pm.zip")] <- list("[Street Address]", "[City]", "[State]", "[Zip Code]")
+
+bmgCombAddr03 <- bmgCombAddr02 %>%
+  select(-PrimaryStreet)
+
+bmgAllAddr <- bloomConstsFinal %>%
+  filter(is.na(PrimaryStreet) == FALSE & str_detect(PrimaryStreet, "[|]") == FALSE) %>%
+  select(bloomID, PrimaryStreet, PrimaryCity, PrimaryState, PrimaryZipCode)
+
+for(idNum in c(bmgCombAddr03$bloomID)){
+  bmgAllAddr[bmgAllAddr$bloomID == idNum, c("PrimaryStreet", "PrimaryCity", "PrimaryState", "PrimaryZipCode")] <- bmgCombAddr03[bmgCombAddr03$bloomID == idNum, c("pm.address", "pm.city", "pm.state", "pm.zip")]
+}
+
+bmgAllAddr$PrimaryStreet <- str_replace_all(bmgAllAddr$PrimaryStreet, "\n", " ")
+bmgAllAddr$PrimaryStreet <- str_remove_all(bmgAllAddr$PrimaryStreet, ",|\\.")
+bmgAllAddr$PrimaryCity <- str_to_title(bmgAllAddr$PrimaryCity)
+bmgAllAddr$PrimaryState <- str_to_upper(bmgAllAddr$PrimaryState)
+
+for(i in 1:nrow(bmgAllAddr)){
+  if(grepl(c("PO Box|P O Box"), bmgAllAddr$PrimaryStreet[i], ignore.case = TRUE) == FALSE & grepl("^\\D", bmgAllAddr$PrimaryStreet[i]) == TRUE){
+    bmgAllAddr$newStreet[i] <- str_remove(bmgAllAddr$PrimaryStreet[i], "^\\D+")
+  }else{
+    bmgAllAddr$newStreet[i] <- bmgAllAddr$PrimaryStreet[i]
+  }
+}
+
+#write.csv(bmgAllAddr, "bmgAddrForGeocodingFINAL.csv", quote = FALSE, row.names = FALSE, na = "")
+```
+
+Congressional districts are according to the 116th U.S. Congress.
+
+```{r}
+# Import geocoded file and combine with full data set:
+bmgGeocoded <- read.csv("bmgAddrForGeocodingFINAL_DONE.csv", header = TRUE, na.strings = "", colClasses = c(Zip = "character"))
+
+bmgGeocoded %>%
+  separate(PrimaryZipCode, into = c("PrimaryZipCode", "zip4"), sep = "-") %>%
+  filter(PrimaryZipCode != Zip | PrimaryCity != City) %>%
+  relocate(PrimaryZipCode, Zip, PrimaryCity, City, Congressional.District, .before = 1)
+
+bmgCDs <- bmgGeocoded %>%
+  select(bloomID, Number, Street, Unit.Type, Unit.Number, City, State, Zip, Country, Congressional.District)
+
+bloomConstsFinal$bloomID <- as.numeric(bloomConstsFinal$bloomID)
+
+bmgKnownCDs <- full_join(bloomConstsFinal, bmgCDs, by = "bloomID") %>%
+  rename(GA_knownCD = Congressional.District) %>%
+  mutate(across(all_of(c("Number", "Street", "Unit.Type", "Unit.Number", "City", "State", "Zip", "Country")), ~ str_replace_na(.x, "")))
+
+for(i in 1:nrow(bmgKnownCDs)){
+  if(grepl("PO Box", bmgKnownCDs$Street[i]) == TRUE){
+    bmgKnownCDs$addressSuggested[i] <- str_squish(str_c(bmgKnownCDs[i, c("Street", "Number", "Unit.Type", "Unit.Number", "City", "State", "Zip", "Country")], collapse = " "))
+  }else{
+    bmgKnownCDs$addressSuggested[i] <- str_squish(str_c(bmgKnownCDs[i, c("Number", "Street", "Unit.Type", "Unit.Number", "City", "State", "Zip", "Country")], collapse = " "))
+  }
+}
+
+bmgKnownCDs <- bmgKnownCDs %>%
+  select(-c(Number, Street, Unit.Type, Unit.Number, City, State, Zip, Country))
+```
+
+# Additional Addresses
+
+```{r}
+addlAddresses <- read.csv("Z:/Bloomerang Constituents Final From Suzanne.csv", header = TRUE)
+addlAddresses <- addlAddresses %>%
+  select(bloomID, addressSuggested) %>%
+  filter(addressSuggested != "")
+
+for(i in 1:nrow(addlAddresses)){
+  bmgKnownCDs$addressSuggested[bmgKnownCDs$bloomID == addlAddresses$bloomID[i]] <- addlAddresses$addressSuggested[i]
+}
+```
+
+# Standardize Congressional District Format
+
+```{r}
+for(i in 1:nrow(bmgKnownCDs)){
+  if(is.na(bmgKnownCDs$GA_knownCD[i]) == TRUE){
+    bmgKnownCDs$GA_knownCD[i] <- NA
+  }else if(str_count(bmgKnownCDs$GA_knownCD[i], "[:digit:]") == 1){
+    letters <- str_c(unlist(str_extract_all(bmgKnownCDs$GA_knownCD[i], "[:alpha:]")), collapse = "")
+    numbers <- str_extract_all(bmgKnownCDs$GA_knownCD[i], "[:digit:]")
+    bmgKnownCDs$GA_knownCD[i] <- str_c(letters, "0", numbers, collapse = "")
+  }
+}
+```
+
+```{r}
+bloomConstsFinal <- bmgKnownCDs
+# From Caris:
+bloomConstsFinal$DonationSegments <- 
+  ifelse(is.na(bloomConstsFinal$LatestTransactionDate), "Not a Donor",
+         ifelse(year(bloomConstsFinal$LatestTransactionDate) == year(Sys.Date()) &
+                  is.na(bloomConstsFinal$LatestTransactionDate) == FALSE, "This Year", 
+                ifelse(year(bloomConstsFinal$LatestTransactionDate) == year(Sys.Date()-years(1)) &
+                         is.na(bloomConstsFinal$LatestTransactionDate) == FALSE, "Last Year", 
+                       ifelse(year(bloomConstsFinal$LatestTransactionDate) == year(Sys.Date()-years(2)) &
+                                is.na(bloomConstsFinal$LatestTransactionDate) == FALSE, "2 Years Ago",
+                              "More Than 2 Years Ago"
+                       ))))
+
+bloomConstsFinal %>%
+  group_by(DonationSegments) %>%
+  summarize(n())
+
+bloomConstsFinal <- bloomConstsFinal %>%
+  mutate(across(all_of(c("PrimaryStreet", "EnvelopeName")), ~ str_replace_all(.x, "\n", " ")))
+```
+
+# Problem Columns
+
+```{r}
+bloomConstsConflicts <- bloomConstsFinal %>%
+  select(bloomID, AccountNumber, FullName, PrimaryStreet, PrimaryCity, PrimaryState, PrimaryZipCode, Employer, EnvelopeName, FormalName, CustomHomeOwner, JobTitle, Prefix, RecognitionName, SortName) %>%
+  filter(FullName != "[Constituent Name]")
+
+for(row in 1:nrow(bloomConstsConflicts)){
+  conflictCt <- vector()
+  for(col in 4:length(bloomConstsConflicts)){
+    conflictCt <- append(conflictCt, str_detect(bloomConstsConflicts[row, col], "[|]"))
+  }
+  conflictSum <- sum(conflictCt, na.rm = TRUE)
+  bloomConstsConflicts[row, "nConflicts"] <- conflictSum
+}
+# `accountNumber` does not count as a conflict here!
+
+bloomConstsConflicts <- bloomConstsConflicts %>%
+  arrange(desc(nConflicts)) %>%
+  filter(nConflicts > 0)
+
+bloomConflictsOnly <- bloomConstsConflicts
+for(col in 4:(length(bloomConflictsOnly)-1)){
+  for(row in 1:nrow(bloomConflictsOnly)){
+    if(grepl("[|]", bloomConflictsOnly[row, col]) == FALSE){
+      bloomConflictsOnly[row, col] <- NA
+    }
+  }
+}
+
+#write.csv(bloomConstsConflicts, "Z:/Bloomerang Constituents - Conflicts Full Rows v2.csv", na = " ", row.names = F, quote = F)
+bloomConflictsOnly <- bloomConflictsOnly %>%
+  select(-bloomID)
+#write.csv(bloomConflictsOnly, "Z:/Final Files/Bloomerang Conflicts.csv", na = "", row.names = F)
+```
+
+# For Joining
+
+```{r}
+bloomConstsForJoin <- bloomConstsFinal %>%
+  mutate(across(all_of(c("Email1", "Email2", "Email3")), ~ str_to_lower(.x))) %>%
+  select(bloomID, Email1, Email2, Email3) %>%
+  pivot_longer(cols = c("Email1", "Email2", "Email3"), names_to = "addressNum", values_to = "emailAddress") %>%
+  filter(is.na(emailAddress) == FALSE) %>%
+  select(-addressNum)
+
+#write.csv(bloomConstsForJoin, "Z:/Final Files/Bloomerang Constituents For Joining.csv", na = "", row.names = F)
+```
+
+```{r}
+bloomConstsFinal <- bloomConstsFinal %>%
+  select(-bloomID)
+#write.csv(bloomConstsFinal, "Z:/Final Files/Bloomerang Constituents - Individuals.csv", na = "", row.names = F)
+```
+
+
+
+
+
+
+
+

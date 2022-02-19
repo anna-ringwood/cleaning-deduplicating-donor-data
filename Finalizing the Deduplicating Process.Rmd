@@ -1,0 +1,638 @@
+---
+title: "Finalizing the Deduplicating Process"
+author: "Anna Ringwood"
+date: "5/31/2021 (Last Updated: 6/5/2021)"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(janitor)
+library(lubridate)
+library(skimr)
+```
+
+# **Version 1:**
+
+## Clean Data:
+
+```{r}
+bloomConstsRaw <- read.csv("Z:/Emory QTM - Constituents - All Fields CSV.csv", header = TRUE, na.strings = "")
+```
+
+The initial object is a data frame with 3,771 rows (records) and 78 columns (variables).
+
+```{r}
+### Define `remove_str_make_num()`:
+remove_str_make_num <- function(df_column, char_to_remove){
+  df_column <- as.numeric(str_remove(df_column, char_to_remove))
+  return(df_column)
+}
+```
+
+```{r warning = F}
+bloomConstsClean <- bloomConstsRaw %>%
+  clean_names("lower_camel") %>%
+  rename(todaysDate = todaySDate, vipsAndInfluencers = viPsAndInfluencers) %>%
+  mutate(createdDate = mdy_hm(createdDate), lastModifiedDate = mdy_hm(lastModifiedDate),
+         across(c(contains("TransactionDate"), "birthdate", "todaysDate"), ~ mdy(.x)),
+         across(contains(c("Amount", "Raised", "Revenue")), ~ remove_str_make_num(.x, "[$]")),
+         numberOfTransactions = remove_str_make_num(numberOfTransactions, ","),
+         #across(where(is.character), str_to_lower)
+         ) %>%
+  select(-name1)
+```
+
+The resulting object is a data frame with 3,771 records and 77 variables.
+
+```{r}
+totalsBloomConsts <- bloomConstsClean[1,]
+bloomConstsClean <- bloomConstsClean[-1,]
+```
+
+The resulting objects are two data frames, one with 3,770 records and 77 variables and the other with 1 record and 77 variables.
+
+## Deduplicate Data:
+
+The goal is to get to a data set where each individual's name is unique.
+
+```{r}
+duplicateIndivs <- bloomConstsClean %>%
+  filter(type == "Individual" & name != "[Constituent Name]" & name != "[Constituent Name]") %>%
+  group_by(name) %>%
+  summarize(numOccur = n()) %>%
+  filter(numOccur != 1) %>%
+  pull(name)
+```
+
+220 individual names appear more than once, accounting for 460 records.
+
+```{r}
+duplicateRecords <- bloomConstsClean %>%
+  filter(name %in% duplicateIndivs)
+nonDuplicates <- bloomConstsClean %>%
+  filter(!(name %in% pull(duplicateRecords, name)))
+### This pulls the organizations too!
+```
+
+## Helper Functions:
+
+Some scenarios to consider when collapsing duplicate records:
+
+* Across all records for a name, the values for a variable are the same  
+  * In this case, the value is copied over to the new record  
+  
+```{r}
+identicalRecordVals <- function(df_column){
+  identicalVals <- vector()
+  for(i in 2:length(df_column)){
+    identicalVals <- append(identicalVals, identical(df_column[i], df_column[i-1]))
+  }
+  if(sum(identicalVals == FALSE) == 0){
+    verdict <- TRUE
+  } else {
+    verdict <- FALSE
+  }
+  return(verdict)
+}
+```
+
+* Across all records for a name, there is at least one `NA` value in a variable but the remaining value(s) are the same  
+  * In this case, the unique, non-NA value is copied over to the new record  
+  
+```{r}
+oneUniqueField <- function(df_column){
+  colNoNA <- na.omit(df_column)
+  if(length(unique(colNoNA)) == 1){
+    verdict <- TRUE
+  } else {
+    verdict <- FALSE
+  }
+  return(verdict)
+}
+```
+
+* The values for a variable are additive and should be aggregated  
+  * In this case, all values across the records are pasted together  
+  
+```{r}
+aggregatableVars <- c("primaryEmailAddress", "accountNumber", "emailInterestType", "eventsAttended", "jobTitle", "[variable]", "vipsAndInfluencers", "employer", "primaryStreet", "primaryZipCode", "homeOwner", "primaryCity", "envelopeName", "formalName", "recognitionName", "nameTitle", "sortName", "isInAHousehold")
+
+aggregateVals <- function(df_column){
+  aggregated <- ""
+  for(row in 1:length(df_column)){
+    if(row == length(df_column)){
+      aggregated <- paste0(aggregated, df_column[row])
+    }else{
+      aggregated <- paste0(aggregated, df_column[row], "|")
+    }
+  }
+  return(aggregated)
+}
+```
+
+* Across all records for a name, there are at least two non-NA values for a variable  
+  * In this case, a closer examination of the fields and values is required  
+    * `engagementLevel`/`generosity`: highest value is kept  
+    * `lastModifiedDate`: most recent date is kept  
+    * `lastModifiedBy`: whatever is attached to the kept `lastModifiedDate`
+  
+* Convert `generosity` and `engagementLevel` to integers so that the higher value can be kept
+
+```{r}
+duplicateRecords$generosity <- as.numeric(as.character(factor(duplicateRecords$generosity, levels = c("not scanned", "cold", "cool", "warm", "hot", "on fire!"), labels = c("0", "1", "2", "3", "4", "5"), ordered = TRUE)))
+duplicateRecords$engagementLevel <- as.numeric(as.character(factor(duplicateRecords$engagementLevel, levels = c("cold", "cool", "warm", "hot", "on fire!"), labels = c("1", "2", "3", "4", "5"), ordered = TRUE)))
+
+keepHighestVars <- c("engagementLevel", "generosity", "lastModifiedDate")
+```
+
+## Collapse Personal Info:
+
+```{r}
+collapseRecords <- function(full_name){
+  
+  # create newRecord to hold deduplicated information
+  newRecord <- bloomConstsClean[1,]
+  newRecord[1,] <- NA
+  
+  transDF <- knownDupRecords %>%
+  select(name, contains("transaction") | contains("revenue") | contains("raised")) %>%
+    filter(name == full_name)
+  personalInfoDF <- knownDupRecords %>%
+  select(!contains(c("transaction", "revenue", "raised"))) %>%
+    filter(name == full_name)
+  
+  # run identicalRecordVals() on all columns
+  identicalVerdicts <- personalInfoDF %>%
+    summarize(across(everything(), ~ identicalRecordVals(.x)))
+  # split variables based on True/False
+  identicalTrue <- personalInfoDF[,identicalVerdicts == TRUE, drop = FALSE]
+  identicalTrueNames <- names(identicalTrue)
+  identicalFalse <- personalInfoDF[,identicalVerdicts == FALSE, drop = FALSE]
+  identicalFalseNames <- names(identicalFalse)
+  # add True results to newRecord
+  newRecord[1, identicalTrueNames] <- personalInfoDF[1, identicalTrueNames]
+
+  # run oneUniqueField() on all remaining columns
+  oneUniqueVerdicts <- identicalFalse %>%
+    summarize(across(everything(), ~ oneUniqueField(.x)))
+  # split based on True/False
+  oneUniqueTrue <- identicalFalse[,oneUniqueVerdicts == TRUE, drop = FALSE]
+  oneUniqueTrueNames <- names(oneUniqueTrue)
+  oneUniqueFalse <- identicalFalse[,oneUniqueVerdicts == FALSE, drop = FALSE]
+  oneUniqueFalseNames <- names(oneUniqueFalse)
+  # add True results to newRecord
+  uniqueValsInCol <- oneUniqueTrue %>%
+    summarize(across(everything(), unique)) %>%
+    na.omit()
+  for(col in oneUniqueTrueNames){
+    uniqueVal <- uniqueValsInCol[1, col]
+    newRecord[1, col] <- uniqueVal
+  }
+  
+  # run aggregateVals() on specific remaining columns
+  aggregateResults <- oneUniqueFalse %>%
+    summarize(across(any_of(aggregatableVars), ~ aggregateVals(.x)))
+  # split based on what was/was not aggregated
+  aggregatedTrue <- oneUniqueFalse[,names(aggregateResults), drop = FALSE]
+  aggregatedTrueNames <- names(aggregatedTrue)
+  aggregatedFalse <- oneUniqueFalse[,-which(names(oneUniqueFalse) %in% aggregatedTrueNames), drop = FALSE]
+  aggregatedFalseNames <- names(aggregatedFalse)
+  # add True results to newRecord
+  newRecord[1, aggregatedTrueNames] <- aggregateResults[1, aggregatedTrueNames]
+  
+  # run keepHighestVal() on specific remaining columns
+  keptHighest <- aggregatedFalse %>%
+    summarize(across(any_of(keepHighestVars), ~ max(.x, na.rm = TRUE)))
+  keptHighestTrueNames <- names(keptHighest)
+  newRecord[1, keptHighestTrueNames] <- keptHighest[1,]
+  if("lastModifiedDate" %in% keptHighestTrueNames){
+    newLastModBy <- personalInfoDF[personalInfoDF$lastModifiedDate == keptHighest$lastModifiedDate, "lastModifiedBy"]
+    newRecord[1, "lastModifiedBy"] <- newLastModBy[1]
+    keptHighestTrueNames <- append(keptHighestTrueNames, "lastModifiedBy")
+  }
+  
+  # check if any columns remain uncombined
+  combinedColNames <- c(identicalTrueNames, oneUniqueTrueNames, aggregatedTrueNames, keptHighestTrueNames)
+  uncombinedCols <- personalInfoDF %>%
+    select(-all_of(combinedColNames))
+  uncombinedNames <- names(uncombinedCols)
+  
+  # address `numberOfNotes` column
+  if("numberOfNotes" %in% uncombinedNames){
+    newRecord[1, "numberOfNotes"] <- sum(personalInfoDF$numberOfNotes, na.rm = TRUE)
+    uncombinedCols <- uncombinedCols %>%
+      select(-numberOfNotes)
+    uncombinedNames <- names(uncombinedCols)
+  }
+  
+  # and `numberOfInteractions` column
+  if("numberOfInteractions" %in% uncombinedNames){
+    newRecord[1, "numberOfInteractions"] <- sum(personalInfoDF$numberOfInteractions, na.rm = TRUE)
+    uncombinedCols <- uncombinedCols %>%
+      select(-numberOfInteractions)
+    uncombinedNames <- names(uncombinedCols)
+  }
+  
+  results_list <- list("allDuplicateRecords" = personalInfoDF, "remainingColumns" = uncombinedCols, "deduplicatedRecord" = newRecord, "transactionData" = transDF)
+  
+  return(results_list)
+}
+```
+
+## Collapse Transaction Info:
+
+```{r}
+collapseTransactions <- function(transactionDF, newIndivRecord){
+  
+  tempDF <- transactionDF
+  tempDF[tempDF == 0] <- NA
+  tempDF <- tempDF[,-1]
+  
+  if(dim(tempDF)[1] * dim(tempDF)[2] == sum(is.na(tempDF))){
+    newIndivRecord[1, names(tempDF)] <- transactionDF[1, -1]
+  }else{
+    firstTrans <- transactionDF[,c("firstTransactionAmount", "firstTransactionDate")]
+    largestTrans <- transactionDF[,c("largestTransactionAmount", "largestTransactionDate")]
+    latestTrans <- transactionDF[,c("latestTransactionAmount", "latestTransactionDate")]
+    secondTrans <- transactionDF[,c("secondTransactionAmount", "secondTransactionDate")]
+    
+    transDFnames <- c("amount", "date")
+    names(firstTrans) <- transDFnames
+    names(largestTrans) <- transDFnames
+    names(latestTrans) <- transDFnames
+    names(secondTrans) <- transDFnames
+    
+    allUnqTrans <- rbind(firstTrans, largestTrans, latestTrans, secondTrans) %>%
+      arrange(date) %>%
+      mutate(amount = round(as.numeric(amount), digits = 2)) %>%
+      unique() %>%
+      filter(is.na(amount) == FALSE & is.na(date) == FALSE) %>%
+      mutate(transNum = seq.int(nrow(.)))
+    newIndivRecord$numberOfTransactions <- nrow(allUnqTrans)
+    
+    ### Fill in final record fields:
+    ### What about different "amounts" on the same day?
+    #n_distinct(allUnqTrans$date) < nrow(allUnqTrans)
+    ### Or the same amount on different days?
+    #n_distinct(allUnqTrans$amount) < nrow(allUnqTrans)
+    
+    newIndivRecord$firstTransactionDate <- allUnqTrans$date[allUnqTrans$transNum == 1, drop = FALSE]
+    newIndivRecord$firstTransactionAmount <- allUnqTrans$amount[allUnqTrans$transNum == 1, drop = FALSE]
+    if(newIndivRecord$numberOfTransactions >= 2){
+      newIndivRecord$secondTransactionDate <- allUnqTrans$date[allUnqTrans$transNum == 2, drop = FALSE]
+      newIndivRecord$secondTransactionAmount <- allUnqTrans$amount[allUnqTrans$transNum == 2, drop = FALSE]
+    }else{
+      newIndivRecord$secondTransactionDate <- NA
+      newIndivRecord$secondTransactionAmount <- NA
+    }
+    newIndivRecord$latestTransactionDate <- max(allUnqTrans$date, na.rm = TRUE)
+    newIndivRecord$latestTransactionAmount <- pull(filter(allUnqTrans, date == newIndivRecord$latestTransactionDate), amount)[1]
+    if(sum(allUnqTrans$amount == 0)){
+      newIndivRecord$largestTransactionDate <- NA
+      newIndivRecord$largestTransactionAmount <- NA
+    }else{
+      newIndivRecord$largestTransactionAmount <- max(allUnqTrans$amount, na.rm = TRUE)
+      newIndivRecord$largestTransactionDate <- pull(filter(allUnqTrans, amount == newIndivRecord$largestTransactionAmount), date)[1]
+    }
+    
+    ### Fill in transaction records based on previous transaction vars:
+    newIndivRecord$lifetimeRaised <- sum(allUnqTrans$amount)
+    fiscalYearStart <- as.Date("07/01/2020", format = c("%m/%d/%Y"))
+    fiscalYearEnd <- as.Date("06/30/2021", format = c("%m/%d/%Y"))
+    newIndivRecord$lastYearRaised <- allUnqTrans %>%
+      filter(date >= fiscalYearStart & date <= fiscalYearEnd) %>%
+      summarize(lastYearRaised = sum(amount)) %>%
+      pull(lastYearRaised)
+  }
+  
+  return(newIndivRecord)
+  
+}
+```
+
+## Run Collapsing Functions on All Individuals:
+
+Applying the merging functions to all duplicate individuals:
+
+```{r}
+newRecordsDF <- data.frame()
+partiallyCollapsed <- vector()
+uniqueNames <- unique(duplicateRecords$name)
+for(indivName in uniqueNames){
+  recordsList <- collapseRecords(duplicateRecords, indivName)
+  fullRecord <- collapseTransactions(recordsList[["transactionData"]], recordsList[["deduplicatedRecord"]])
+  newRecordsDF <- rbind(newRecordsDF, fullRecord)
+  if(length(recordsList[["remainingColumns"]]) != 0){
+    partiallyCollapsed <- append(partiallyCollapsed, indivName)
+  }
+}
+
+### Check merging:
+uncollapsedRecords <- duplicateRecords %>%
+  filter(name %in% partiallyCollapsed)
+
+uncollapsed <- data.frame()
+remainingCols <- vector()
+for(name in partiallyCollapsed){
+  uncollapsedRecords <- collapseRecords(duplicateRecords, name)
+  remainingCols <- append(remainingCols, names(uncollapsedRecords[["remainingColumns"]]))
+  uncollapsed <- rbind(uncollapsed, c(name, str_flatten(names(uncollapsedRecords[["remainingColumns"]]), collapse = ", ")))
+}
+
+table(remainingCols)
+
+unique(remainingCols)
+
+### And re-join to non-duplicated individuals:
+bloomConstsFinal <- rbind(newRecordsDF, nonDuplicates)
+```
+
+## Miscellaneous Clean-Up:
+
+Splitting up emails into one email/field:
+
+```{r}
+for(i in 1:nrow(bloomConstsFinal)){
+  allEntries <- unlist(str_split(bloomConstsFinal[i, "primaryEmailAddress"], "[|]"))
+  bloomConstsFinal[i, "primaryEmailAddress"] <- str_c(unique(allEntries), collapse = "|")
+}
+bloomConstsFinal <- bloomConstsFinal %>%
+  separate(primaryEmailAddress, into = c("email1", "email2", "email3"), sep = "[|]")
+```
+
+Removing aggregated duplicates:
+
+```{r}
+for(var in c("[variable]", "EventsAttended")){
+  for(i in 1:nrow(bloomConstsFinal)){
+    allEntries <- unlist(str_split(bloomConstsFinal[i, var], "[|]"))
+    bloomConstsFinal[i, var] <- str_c(unique(allEntries), collapse = "|")
+  }
+}
+```
+
+Write to CSV:
+
+```{r}
+write.csv(bloomConstsFinal, "Bloomerang Constituents - Individuals v1.csv", row.names = FALSE, na = "")
+```
+
+# **Version 2**
+
+## Clean Data:
+
+```{r}
+bloomSkim <- skim(bloomConstsClean)
+
+n_miss <- bloomSkim %>%
+  select(skim_variable, n_missing) %>%
+  arrange(desc(n_missing))
+
+bloomConstsFinal <- read.csv("Z:/Bloomerang Constituents - Individuals v1.csv", header = TRUE, na.strings = "")
+
+filter(bloomConstsFinal, grepl("[|]", primaryStreet) == TRUE)
+```
+
+```{r}
+bloomConstsRaw <- read.csv("Z:/Emory QTM - Constituents - All Fields CSV.csv", header = TRUE, na.strings = "")
+sum(bloomConstsRaw$name != bloomConstsRaw$Name.1)
+```
+
+The initial object is a data frame with 3,771 rows (records) and 78 columns (variables).
+
+```{r}
+### Define `remove_str_make_num()`:
+remove_str_make_num <- function(df_column, char_to_remove){
+  df_column <- as.numeric(str_remove(df_column, char_to_remove))
+  return(df_column)
+}
+```
+
+```{r warning = F}
+bloomConstsClean <- bloomConstsRaw %>%
+  clean_names("lower_camel") %>%
+  rename(todaysDate = todaySDate, vipsAndInfluencers = viPsAndInfluencers) %>%
+  mutate(createdDate = mdy_hm(createdDate), lastModifiedDate = mdy_hm(lastModifiedDate),
+         across(c(contains("TransactionDate"), "birthdate", "todaysDate"), ~ mdy(.x)),
+         across(contains(c("Amount", "Raised", "Revenue")), ~ remove_str_make_num(.x, "[$]")),
+         numberOfTransactions = remove_str_make_num(numberOfTransactions, ",")) %>%
+  select(-name1)
+```
+
+The resulting object is a data frame with 3,771 records and 77 variables.
+
+```{r}
+totalsBloomConsts <- bloomConstsClean[1,]
+bloomConstsClean <- bloomConstsClean[-1,]
+```
+
+The resulting objects are two data frames, one with 3,770 records and 77 variables and the other with 1 record and 77 variables.
+
+## Find Duplicates:
+
+The goal is to get to a data set where each individual's name is unique. The name "Friend Unknown" is used for multiple individuals for whom the nonprofit doesn't have name data. To avoid collapsing these different people, this name is filtered out initially.
+
+```{r}
+### Get names of individuals which appear more than once
+duplicateIndivs <- bloomConstsClean %>%
+  filter(type == "Individual") %>%
+  group_by(name) %>%
+  summarize(numOccur = n()) %>%
+  filter(numOccur != 1) %>%
+  pull(name)
+# Total individual accounts: 3319
+
+### Filter out individuals whose names appear more than once
+duplicateRecords <- bloomConstsClean %>%
+  filter(name %in% duplicateIndivs) %>%
+  filter(name != "[Constituent Name]" & name != "[Constituent Name]") %>%
+  filter(!(name == "[Constituent Name]" & employer == "[Constituent Employer]") & !(name == "[Constituent Name]" & employer == "[Constituent Employer]"))
+
+### Fix `duplicateIndivs` correspondingly (mostly for consistency-- I don't think it gets used after this point)
+duplicateIndivs <- duplicateIndivs[duplicateIndivs != "[Constituent Name]" & duplicateIndivs != "[Constituent Name]"]
+
+### Put the remaining records (Individuals *and* Organizations) into a separate data frame
+nonDuplicates <- bloomConstsClean[!(bloomConstsClean$accountNumber %in% duplicateRecords$accountNumber),]
+sum(nonDuplicates$type == "Individual")
+# Total names appearing only once: 2861
+# 2861 + 458 = 3319
+```
+
+220 individual names appear more than once, accounting for 458 records.
+
+## Helper Functions:
+
+Same as in Version 1
+
+## Preliminary Step:
+
+- Filter for records with the same name but different employers
+- Arrange and examine manually (maybe use indicator var for records to keep separate?)
+- Push any remaining duplicates back into `duplicateRecords`
+- Push any records that become non-duplicates into a new data frame (don't push to `nonDuplicates` just yet)
+
+```{r}
+maybeNonDup <- data.frame()
+knownDupRecords <- data.frame()
+
+for(recordName in duplicateIndivs){
+  tempDF <- duplicateRecords %>%
+    filter(name == recordName)
+  unqEmployer <- n_distinct(pull(tempDF, employer), na.rm = TRUE)
+  
+  if(unqEmployer > 1){
+    maybeNonDup <- rbind(maybeNonDup, tempDF)
+  }else{
+    knownDupRecords <- rbind(knownDupRecords, tempDF)
+  }
+}
+
+maybeNonDup2 <- maybeNonDup %>%
+  arrange(name, employer) %>%
+  select(name, employer, accountNumber)
+
+#write.csv(maybeNonDup2, "Employer Data Frame.csv", row.names = FALSE)
+
+### Separate names based on `employer` field:
+employerIndicator <- read.csv("Z:/Employer Data Frame.csv", header = TRUE)
+
+trueNonDups <- employerIndicator %>%
+  filter(isDiff == 1)
+trueDuplicates <- employerIndicator %>%
+  filter(isDiff == 0)
+
+newNonDupRows <- maybeNonDup %>%
+  filter(accountNumber %in% trueNonDups$accountNumber)
+nonDuplicates <- rbind(nonDuplicates, newNonDupRows)
+
+newDupRows <- maybeNonDup %>%
+  filter(accountNumber %in% trueDuplicates$accountNumber)
+knownDupRecords <- rbind(knownDupRecords, newDupRows)
+
+n_distinct(nonDuplicates$name)
+n_distinct(knownDupRecords$name)
+```
+
+Final Data Sets:
+
+1. `nonDuplicates`  
+2. `knownDupRecords`
+
+## Collapse Personal Info:
+
+From here on out, only deal with `knownDupRecords` data set.
+
+```{r}
+newRecordsDF <- data.frame()
+partiallyCollapsed <- vector()
+uniqueNames <- unique(knownDupRecords$name)
+for(indivName in uniqueNames){
+  recordsList <- collapseRecords(knownDupRecords, indivName)
+  fullRecord <- collapseTransactions(recordsList[["transactionData"]], recordsList[["deduplicatedRecord"]])
+  newRecordsDF <- rbind(newRecordsDF, fullRecord)
+  if(length(recordsList[["remainingColumns"]]) != 0){
+    partiallyCollapsed <- append(partiallyCollapsed, indivName)
+  }
+}
+
+### Check merging:
+uncollapsedRecords <- knownDupRecords %>%
+  filter(name %in% partiallyCollapsed)
+uncollapsedRecords <- uncollapsedRecords %>%
+  arrange(name) %>%
+  relocate(employer, .before = 1)
+
+uncollapsed <- data.frame()
+remainingCols <- vector()
+for(name in partiallyCollapsed){
+  uncollapsedRecords <- collapseRecords(knownDupRecords, name)
+  remainingCols <- append(remainingCols, names(uncollapsedRecords[["remainingColumns"]]))
+  uncollapsed <- rbind(uncollapsed, c(name, str_flatten(names(uncollapsedRecords[["remainingColumns"]]), collapse = ", ")))
+}
+
+if(nrow(uncollapsed) > 0){
+  names(uncollapsed) <- c("name", "remainingCols")
+  table(remainingCols)
+  unique(remainingCols)
+}
+
+uncollapsedEmployer <- uncollapsedRecords %>%
+  filter(name %in% pull(filter(uncollapsed, grepl("employer", remainingCols)), name))
+uncollapsedRecords %>%
+  filter(name %in% pull(filter(uncollapsed, grepl("primaryStreet", remainingCols)), name))
+uncollapsedRecords %>%
+  filter(name %in% pull(filter(uncollapsed, grepl("homeOwner", remainingCols)), name)) %>%
+  relocate(homeOwner, .before = 1)
+uncollapsedRecords %>%
+  filter(name %in% pull(filter(uncollapsed, grepl("sortName", remainingCols)), name)) %>%
+  relocate(sortName, .before = 1)
+```
+
+```{r}
+### And re-join to non-duplicated individuals:
+bloomConstsFinal <- rbind(newRecordsDF, nonDuplicates)
+```
+
+## Miscellaneous Clean-Up:
+
+Splitting up emails into one email/field:
+
+```{r}
+for(i in 1:nrow(bloomConstsFinal)){
+  allEntries <- unlist(str_split(bloomConstsFinal[i, "primaryEmailAddress"], "[|]"))
+  bloomConstsFinal[i, "primaryEmailAddress"] <- str_c(unique(allEntries), collapse = "|")
+}
+bloomConstsFinal <- bloomConstsFinal %>%
+  separate(primaryEmailAddress, into = c("email1", "email2", "email3"), sep = "[|]")
+```
+
+Removing aggregated duplicates:
+
+```{r}
+for(var in c("[variable]", "EventsAttended")){
+  for(i in 1:nrow(bloomConstsFinal)){
+    allEntries <- unlist(str_split(bloomConstsFinal[i, var], "[|]"))
+    bloomConstsFinal[i, var] <- str_c(unique(allEntries), collapse = "|")
+  }
+}
+```
+
+Write to CSV:
+
+```{r}
+write.csv(bloomConstsFinal, "Bloomerang Constituents - Individuals v1.csv", row.names = FALSE, na = "")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

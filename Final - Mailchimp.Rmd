@@ -1,0 +1,267 @@
+---
+title: "Final - Mailchimp"
+author: "Anna Ringwood"
+date: "8/6/2021"
+output: html_document
+---
+
+This is the final version of the code to clean and wrangle the data from Mailchimp Much of it is similar or identical to code from the previous files, but here it has been cleaned and annotated for ease of reading.
+
+## Libraries
+
+```{r message = F}
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(postmastr)
+library(sf)
+```
+
+# Cleaning Data
+
+### Correct Minor Syntax and Character Issues:
+
+Function for column type formatting:
+
+```{r warning = F, echo = F}
+# Define `remove_str_make_num()`:
+remove_str_make_num <- function(df_column, char_to_remove){
+  df_column <- as.numeric(str_remove(df_column, char_to_remove))
+  return(df_column)
+}
+```
+
+Import raw data and clean column appearances and types:
+
+```{r}
+# Read in data (use UTF-8 encoding!)
+mailchimpRaw <- read.csv("Z:/Final Files/subscribed_members_export_06457f1bdc.csv",
+                          encoding = "UTF-8", header = TRUE, na.strings = "")
+
+# Change variable types
+mailchimpClean <- mailchimpRaw %>%
+  clean_names("lower_camel") %>%
+  mutate(across(all_of(c("latitude", "longitude", "gmtoff", "dstoff")), 
+                ~ remove_str_make_num(.x, char_to_remove = "'")),
+         across(all_of(c("optinTime", "confirmTime", "lastChanged")), ~ ymd_hms(.x)),
+         address = str_squish(address),
+         tags = str_remove_all(tags, "[\"]"),
+         tags = str_replace_all(tags, ",", "|"))
+```
+
+Fix observation encoding errors:
+
+```{r echo = T, results = 'hide'}
+# Identify columns with non-Latin characters
+mailchimpClean %>%
+  select(where(is.character)) %>%
+  summarize(across(everything(), ~ sum(str_detect(.x, "[^[:alnum:]^[:space:]^\\.^'^,^@^_^-]"), na.rm = TRUE)))
+
+# Fix identified observations
+mailchimpClean[str_which(mailchimpClean$firstName, "[^[:alnum:]^[:space:]^\\.^'^,^@^_^-]"),]
+mailchimpClean$firstName[mailchimpClean$firstName == "[Name containing Ã¡]"] <- "[Corrected name]"
+mailchimpClean$firstName[mailchimpClean$firstName == "[Name containing â\200œ]"] <- "[Corrected name]"
+
+mailchimpClean[str_which(mailchimpClean$lastName, "[^[:alnum:]^[:space:]^\\.^'^,^@^_^-]"),]
+mailchimpClean[2104, "lastName"] <- "[Corrected name]"
+
+mailchimpClean[str_which(mailchimpClean$address, "[^[:alnum:]^[:space:]^\\.^'^,^@^_^-]"),]
+
+mailchimpClean[str_which(mailchimpClean$organization, "[^[:alnum:]^[:space:]^\\.^'^,^@^_^-]"),]
+
+mailchimpClean[str_which(mailchimpClean$agesOfChildren, "[^[:alnum:]^[:space:]^\\.^'^,^@^_^-]"),]
+
+mailchimpClean[str_which(mailchimpClean$timezone, "[^[:alnum:]^[:space:]^\\.^'^,^@^_^/^-]"),]
+
+mailchimpClean[str_which(mailchimpClean$tags, "[^[:alnum:]^[:space:]^\\.^'^,^@^_^|^-]"),]
+```
+
+Fix weird name entries:
+
+```{r}
+### See if anyone entered their full name into the first name field and left the last name field blank:
+mcNames <- mailchimpClean %>%
+  filter(is.na(firstName) == FALSE & is.na(lastName) == FALSE)
+# No one from the duplicates left the last name field blank
+
+mcNames[mcNames$emailAddress == "[Email Address]", "firstName"] <- "[Constituent Name]"
+mcNames[mcNames$emailAddress == "[Email Address]", "lastName"] <- "[Constituent Name]"
+
+### See which observations have their last name included in their first name response:
+indices <- str_which(mcNames$firstName, mcNames$lastName)
+mcNames2 <- mcNames[indices,]
+mcNames2 <- mcNames2 %>%
+  filter(firstName != "[Constituent Name]")
+
+### Remove the last names from the first name field:
+mcNames2$suggestedFirstName <- str_replace_all(mcNames2$firstName, mcNames2$lastName, "")
+relocate(mcNames2, suggestedFirstName, .before = firstName)
+mcNames2 <- select(mcNames2, emailAddress, suggestedFirstName)
+
+mailchimpClean <- full_join(mailchimpClean, mcNames2, by = "emailAddress")
+```
+
+Add unique ID column:
+
+```{r}
+mailchimpClean$mcID <- c(1:nrow(mailchimpClean))
+mailchimpClean <- relocate(mailchimpClean, mcID, .before = 1)
+```
+
+### Correct Address Formatting:
+
+Extract all observations for which an address is given:
+
+*Note: The four addresses that receive correction prior to running the final `pm_parse()` were identified only after an initial run of `pm_parse()` and the changes appear at the beginning of the process below for simplification and conciseness.* 
+
+```{r warning = F, message = F}
+# Separate address from PII data:
+mcAddr01 <- mailchimpClean %>%
+  select(mcID, address, latitude, longitude, gmtoff, dstoff, timezone, cc, region) %>%
+  filter(is.na(address) == FALSE)
+
+# Overall address format corrections:
+mcAddr01$address <- str_remove(mcAddr01$address, " US")
+mcAddr01$address <- str_remove_all(mcAddr01$address, ",|\\.")
+
+# Specific address format corrections:
+mcAddr01$address[mcAddr01$address == "[Address]"] <- "[Corrected Address]"
+mcAddr01$address[mcAddr01$address == "[Address]"] <- "[Corrected Address]"
+mcAddr01$address[mcAddr01$address == "[Address]"] <- "[Corrected Address]"
+mcAddr01$address[mcAddr01$address == "[Address]"] <- "[Corrected Address]"
+mcAddr01$address[mcAddr01$address == "[Address]"] <- "[Corrected Address]"
+
+# Define postmastr dictionaries:
+extra_abbr <- pm_append(type = "state", input = "Ga", output = "GA", locale = "us")
+stateDict <- pm_dictionary(type = "state", filter = c("GA", "AL"), append = extra_abbr,
+                           case = c("title", "upper", "lower"), locale = "us")
+extra_cities <- pm_append(type = "city", input = c("birmingham", "Augusta", "Athens"),
+                          output = c("Birmingham", "Augusta", "Athens"))
+cityDict <- pm_dictionary(type = "city", filter = "GA", append = extra_cities,
+                          case = "title", locale = "us")
+dirDict <- pm_dictionary(type = "directional", case = c("title", "upper", "lower"), locale = "us")
+
+# Parse addresses with postmastr
+mcAddr02 <- pm_identify(mcAddr01, var = "address")
+mcAddr03 <- pm_parse(mcAddr02, input = "full", address = "address", output = "short", keep_parsed = "limited", dir_dict = dirDict, state_dict = stateDict, city_dict = cityDict)
+
+# Additional specific address format corrections:
+mcAddr03[mcAddr03$mcID == 3009, c("pm.address", "pm.city", "pm.state", "pm.zip")] <- list("[Street Address]", "[City]", "[State]", "[Zip Code]")
+# Three additional addresses were corrected in the same way.
+
+# Select only pm-related variables for geocoding:
+mcAddr04 <- mcAddr03 %>%
+  select(mcID, pm.address, pm.city, pm.state, pm.zip, pm.zip4)
+
+# Export data frame to csv file:
+#write.csv(mcAddr04, "mcAddrForGeocodingFINAL.csv", quote = FALSE, row.names = FALSE, na = "")
+```
+
+Upload spreadsheet to Geocod.io and geocode the file, selecting the option to append information about the 116th Congressional District in the output file.
+
+# Geocoding
+
+### Known CDs:
+
+```{r}
+# Import the final file from Geocod.io:
+mcGeocoded <- read.csv("mcAddrForGeocodingFINAL_DONE.csv", header = TRUE, na.strings = "")
+
+# Check for accuracy:
+mcGeocoded %>%
+  filter(pm.zip != Zip | pm.city != City) %>%
+  relocate(pm.zip, Zip, pm.city, City, Congressional.District, .before = 1)
+mailchimpClean[2934,]
+# The street address matches one zip code, but the organization matches a different zip code... Regardless, both addresses fall into the same congressional district
+
+mcCDs <- mcGeocoded %>%
+  select(mcID, Number, Street, Unit.Type, Unit.Number, City, State, Zip, Country, Congressional.District)
+
+mailchimpClean$mcID <- as.numeric(mailchimpClean$mcID)
+mailchimpKnownCDs <- full_join(mailchimpClean, mcCDs, by = "mcID") %>%
+  rename(GA_knownCD = Congressional.District) %>%
+  mutate(across(all_of(c("Number", "Street", "Unit.Type", "Unit.Number", "City", "State", "Zip", "Country")), ~ str_replace_na(.x, "")),
+         addressSuggested = str_squish(str_c(Number, Street, Unit.Type, Unit.Number, City, State, Zip, Country, sep = " ")))
+
+# Additional specific address format corrections:
+mailchimpKnownCDs[mailchimpKnownCDs$mcID == 2371, "addressSuggested"] <- "[Suggested Address]"
+mailchimpKnownCDs[mailchimpKnownCDs$mcID == 2338, "addressSuggested"] <- "[Suggested Address]"
+mailchimpKnownCDs[mailchimpKnownCDs$mcID == 1360, "addressSuggested"] <- "[Suggested Address]"
+mailchimpKnownCDs[mailchimpKnownCDs$mcID == 2799, "addressSuggested"] <- "[Suggested Address]"
+mailchimpKnownCDs[mailchimpKnownCDs$mcID == 1894, "addressSuggested"] <- "[Suggested Address]"
+
+# Remove split columns to be consistent will original address column, and convert empty cells to NA:
+mailchimpKnownCDs <- mailchimpKnownCDs %>%
+  select(-c(Number, Street, Unit.Type, Unit.Number, City, State, Zip, Country))
+mailchimpKnownCDs$addressSuggested[mailchimpKnownCDs$addressSuggested == ""] <- NA
+```
+
+### Inferred CDs:
+
+```{r}
+# Import shape data on the 116th congressional districts:
+shapes <- st_read("tl_2018_us_cd116/tl_2018_us_cd116.shp")
+sum(is.na(mailchimpClean$latitude))
+# 846 observations have no coordinate data
+
+# Separate latitude and longitude coordinates:
+mailchimpCoords <- mailchimpClean %>%
+  select(mcID, longitude, latitude) %>%
+  na.omit()
+```
+
+Convert to `sf` and join to find congressional districts:
+
+```{r}
+mailchimp_sf <- st_as_sf(mailchimpCoords, coords = 2:3, crs = st_crs(shapes))
+
+infCDs_sf <- st_join(mailchimp_sf, shapes)
+sum(is.na(infCDs_sf$CD116FP) == FALSE)
+# CDs found for 2720 (84%) of observations
+
+infCDs_df <- data.frame(infCDs_sf)
+
+mailchimpAllCDs <- infCDs_df %>%
+  select(mcID, CD116FP) %>%
+  full_join(mailchimpKnownCDs, by = "mcID") %>%
+  relocate(CD116FP, .after = GA_knownCD) %>%
+  rename(GA_inferredCD = CD116FP)
+```
+
+Standardize congressional district number format:
+
+```{r}
+mailchimpAllCDs$GA_inferredCD <- str_c("GA", mailchimpAllCDs$GA_inferredCD)
+
+for(i in 1:nrow(mailchimpAllCDs)){
+  if(is.na(mailchimpAllCDs$GA_knownCD[i]) == TRUE){
+    mailchimpAllCDs$GA_knownCD[i] <- NA
+  }else if(str_count(mailchimpAllCDs$GA_knownCD[i], "[:digit:]") == 1){
+    letters <- str_c(unlist(str_extract_all(mailchimpAllCDs$GA_knownCD[i], "[:alpha:]")), collapse = "")
+    numbers <- str_extract_all(mailchimpAllCDs$GA_knownCD[i], "[:digit:]")
+    mailchimpAllCDs$GA_knownCD[i] <- str_c(letters, "0", numbers, collapse = "")
+  }
+}
+```
+
+Write final data set to CSV:
+
+```{r}
+mailchimpForJoin <- mailchimpAllCDs %>%
+  mutate(emailAddress = str_to_lower(emailAddress)) %>%
+  select(mcID, emailAddress)
+
+mailchimpFinal <- mailchimpAllCDs %>%
+  select(-mcID)
+
+names(mailchimpFinal) <- c("Email Address", "First Name", "Last Name", "Address", "Organization",
+                           "representative", "rep email", "senator", "senator email", "ages of children",
+                           "city", "ST Attendees", "MEMBER_RATING", "OPTIN_TIME", "OPTIN_IP",
+                           "CONFIRM_TIME", "CONFIRM_IP", "LATITUDE", "LONGITUDE", "GMTOFF", "DSTOFF",
+                           "TIMEZONE", "CC", "REGION", "LAST_CHANGED", "LEID", "EUID", "NOTES", "TAGS",
+                           "suggestedFirstName", "GA_KnownCD", "GA_InferredCD", "suggestedAddress")
+
+write.csv(mailchimpFinal, "Z:/Final Files/Mailchimp Subscribers.csv", row.names = FALSE, na = "")
+
+write.csv(mailchimpForJoin, "Z:/Final Files/Mailchimp For Joining.csv", row.names = FALSE, na = "")
+```
